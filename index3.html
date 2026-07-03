@@ -1,0 +1,1175 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<title>経費精算台帳</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #f7f2e7; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo } = React;
+
+/* ---- localStorage-backed polyfill of the Claude artifact window.storage API ---- */
+window.storage = {
+  async get(key) {
+    const v = localStorage.getItem(key);
+    if (v === null) throw new Error('key not found: ' + key);
+    return { key, value: v, shared: false };
+  },
+  async set(key, value) {
+    localStorage.setItem(key, value);
+    return { key, value, shared: false };
+  },
+  async delete(key) {
+    localStorage.removeItem(key);
+    return { key, deleted: true, shared: false };
+  },
+  async list(prefix) {
+    const keys = Object.keys(localStorage).filter((k) => !prefix || k.startsWith(prefix));
+    return { keys, prefix, shared: false };
+  },
+};
+
+/* ---- lightweight stand-ins for the lucide-react icons used in the app ---- */
+function makeIcon(glyph) {
+  return function Icon({ size = 14, style = {}, className = '' }) {
+    return (
+      <span
+        className={className}
+        style={{ fontSize: size, lineHeight: 1, display: 'inline-block', ...style }}
+      >
+        {glyph}
+      </span>
+    );
+  };
+}
+const Plus = makeIcon('＋');
+const Trash2 = makeIcon('🗑');
+const Pencil = makeIcon('✎');
+const X = makeIcon('×');
+const Check = makeIcon('✓');
+const Users = makeIcon('👥');
+const CalendarDays = makeIcon('📅');
+const Wallet = makeIcon('💰');
+const ChevronDown = makeIcon('▾');
+const ChevronRight = makeIcon('▸');
+const AlertCircle = makeIcon('⚠');
+const Loader2 = makeIcon('◌');
+const Download = makeIcon('⬇');
+const Settings = makeIcon('⚙');
+const RefreshCw = makeIcon('↻');
+const CheckCircle2 = makeIcon('✅');
+
+
+const CATEGORIES = ['交流会費', '交通費', 'その他'];
+const STORAGE_KEY = 'jimoto-expense-data-v1';
+const SYNC_URL_KEY = 'jimoto-expense-sync-url-v1';
+
+function toSyncRecord(e) {
+  const ym = ymFromDate(e.date);
+  const due = lastDayOfMonth(addMonth(ym));
+  const payStatus = e.status === '確定' ? (e.paid ? '支払済' : '未払') : '-';
+  return {
+    id: e.id,
+    date: e.date,
+    ym,
+    due,
+    personName: e.personName,
+    category: e.category,
+    status: e.status,
+    amount: e.amount,
+    payStatus,
+    memo: e.memo || '',
+  };
+}
+
+async function syncToSheet(gasUrl, records) {
+  if (!gasUrl) return { ok: false, error: '同期URL未設定' };
+  try {
+    const res = await fetch(gasUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+      body: JSON.stringify({ records: records.map(toSyncRecord) }),
+    });
+    const json = await res.json();
+    return json;
+  } catch (err) {
+    return { ok: false, error: String(err) };
+  }
+}
+
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+function ymFromDate(dateStr) {
+  return dateStr ? dateStr.slice(0, 7) : '';
+}
+
+function ymLabel(ym) {
+  if (!ym) return '';
+  const [y, m] = ym.split('-');
+  return `${y}年${parseInt(m, 10)}月`;
+}
+
+function addMonth(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  const d = new Date(y, m, 1); // m is 1-indexed already -> next month
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function lastDayOfMonth(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  const d = new Date(y, m, 0);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function fmtDate(dateStr) {
+  if (!dateStr) return '';
+  const [y, m, d] = dateStr.split('-');
+  return `${y}/${parseInt(m, 10)}/${parseInt(d, 10)}`;
+}
+
+function fmtYen(n) {
+  return '¥' + (n || 0).toLocaleString('ja-JP');
+}
+
+function todayStr() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+function downloadCSV(expenses) {
+  const header = ['発生日', '締め月', '支払期日', '担当者', '費目', '区分', '金額', '支払状況', 'メモ'];
+  const rows = [...expenses]
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .map((e) => {
+      const ym = ymFromDate(e.date);
+      const due = lastDayOfMonth(addMonth(ym));
+      const payStatus = e.status === '確定' ? (e.paid ? '支払済' : '未払') : '-';
+      return [e.date, ym, due, e.personName, e.category, e.status, e.amount, payStatus, (e.memo || '').replace(/[\n,]/g, ' ')];
+    });
+  const csv = [header, ...rows].map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
+  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `経費精算_${todayStr()}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function ExpenseTracker() {
+  const [people, setPeople] = useState([]);
+  const [expenses, setExpenses] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [saveError, setSaveError] = useState(false);
+  const [tab, setTab] = useState('input');
+  const [gasUrl, setGasUrl] = useState('');
+  const [syncStatus, setSyncStatus] = useState('idle'); // idle | syncing | ok | error
+  const [syncMsg, setSyncMsg] = useState('');
+  const [showSettings, setShowSettings] = useState(false);
+
+  // ---- load ----
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await window.storage.get(STORAGE_KEY, false);
+        if (res && res.value) {
+          const parsed = JSON.parse(res.value);
+          setPeople(parsed.people || []);
+          setExpenses(parsed.expenses || []);
+        }
+      } catch (e) {
+        // no existing data yet — fine
+      }
+      try {
+        const urlRes = await window.storage.get(SYNC_URL_KEY, false);
+        if (urlRes && urlRes.value) setGasUrl(urlRes.value);
+      } catch (e) {
+        // no sync url set yet — fine
+      } finally {
+        setLoaded(true);
+      }
+    })();
+  }, []);
+
+  // ---- persist ----
+  useEffect(() => {
+    if (!loaded) return;
+    (async () => {
+      try {
+        const result = await window.storage.set(
+          STORAGE_KEY,
+          JSON.stringify({ people, expenses }),
+          false
+        );
+        setSaveError(!result);
+      } catch (e) {
+        setSaveError(true);
+      }
+    })();
+  }, [people, expenses, loaded]);
+
+  async function saveGasUrl(url) {
+    setGasUrl(url);
+    try {
+      await window.storage.set(SYNC_URL_KEY, url, false);
+    } catch (e) {
+      // ignore — url still usable this session
+    }
+  }
+
+  async function pushToSheet(records) {
+    if (!gasUrl) return;
+    setSyncStatus('syncing');
+    const result = await syncToSheet(gasUrl, records);
+    if (result && result.ok) {
+      setSyncStatus('ok');
+      setSyncMsg(`${new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })} 同期済み`);
+    } else {
+      setSyncStatus('error');
+      setSyncMsg((result && result.error) || '同期に失敗しました');
+    }
+  }
+
+  function addPerson(name) {
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    if (people.some((p) => p.name === trimmed)) return;
+    setPeople((prev) => [...prev, { id: uid(), name: trimmed }]);
+  }
+
+  function removePerson(id) {
+    setPeople((prev) => prev.filter((p) => p.id !== id));
+  }
+
+  function addExpense(exp) {
+    const record = { id: uid(), paid: false, ...exp };
+    setExpenses((prev) => [...prev, record]);
+    if (gasUrl) pushToSheet([record]);
+  }
+
+  function updateExpense(id, patch) {
+    setExpenses((prev) => {
+      const next = prev.map((e) => (e.id === id ? { ...e, ...patch } : e));
+      if (gasUrl) {
+        const updated = next.find((e) => e.id === id);
+        if (updated) pushToSheet([updated]);
+      }
+      return next;
+    });
+  }
+
+  function removeExpense(id) {
+    setExpenses((prev) => prev.filter((e) => e.id !== id));
+  }
+
+  if (!loaded) {
+    return (
+      <div style={styles.loadingWrap}>
+        <Loader2 className="spin" size={22} style={{ color: '#8a6a3b' }} />
+        <span style={{ color: '#6b5b45', fontSize: 14 }}>台帳を読み込み中…</span>
+        <style>{`.spin { animation: spin 0.9s linear infinite; } @keyframes spin { to { transform: rotate(360deg);} }`}</style>
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.app}>
+      <style>{`
+        * { box-sizing: border-box; }
+        input, select, textarea, button { font-family: inherit; }
+        input:focus, select:focus, textarea:focus { outline: 2px solid #8a6a3b33; outline-offset: 1px; }
+        button:focus-visible { outline: 2px solid #8a6a3b; outline-offset: 2px; }
+        table { border-collapse: collapse; width: 100%; }
+        ::selection { background: #d9c39a66; }
+      `}</style>
+
+      <Header
+        saveError={saveError}
+        expenses={expenses}
+        gasUrl={gasUrl}
+        syncStatus={syncStatus}
+        syncMsg={syncMsg}
+        showSettings={showSettings}
+        setShowSettings={setShowSettings}
+      />
+      {showSettings && (
+        <SettingsPanel
+          gasUrl={gasUrl}
+          saveGasUrl={saveGasUrl}
+          expenses={expenses}
+          pushToSheet={pushToSheet}
+          syncStatus={syncStatus}
+          syncMsg={syncMsg}
+          close={() => setShowSettings(false)}
+        />
+      )}
+      <TabBar tab={tab} setTab={setTab} />
+
+      <div style={styles.body}>
+        {tab === 'input' && (
+          <InputTab people={people} addPerson={addPerson} addExpense={addExpense} />
+        )}
+        {tab === 'people' && (
+          <PeopleTab
+            people={people}
+            expenses={expenses}
+            addPerson={addPerson}
+            removePerson={removePerson}
+            updateExpense={updateExpense}
+            removeExpense={removeExpense}
+          />
+        )}
+        {tab === 'monthly' && (
+          <MonthlyTab expenses={expenses} updateExpense={updateExpense} />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Header({ saveError, expenses, gasUrl, syncStatus, syncMsg, showSettings, setShowSettings }) {
+  return (
+    <div style={styles.header}>
+      <div style={styles.headerInner}>
+        <div style={styles.hankoMark}>精算</div>
+        <div>
+          <div style={styles.title}>経費精算台帳</div>
+          <div style={styles.subtitle}>交流会費・交通費 / 月末締め・翌月末払い</div>
+        </div>
+      </div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        {gasUrl && syncStatus !== 'idle' && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 11, color: syncStatus === 'error' ? STAMP_RED : '#4a7a4f' }}>
+            {syncStatus === 'syncing' && <RefreshCw size={12} className="spin-sync" />}
+            {syncStatus === 'ok' && <CheckCircle2 size={12} />}
+            {syncStatus === 'error' && <AlertCircle size={12} />}
+            {syncMsg}
+          </div>
+        )}
+        {saveError && (
+          <div style={styles.saveErrorBadge}>
+            <AlertCircle size={13} /> 保存に失敗しました
+          </div>
+        )}
+        <button
+          onClick={() => downloadCSV(expenses)}
+          disabled={expenses.length === 0}
+          style={{ ...styles.exportBtn, opacity: expenses.length === 0 ? 0.4 : 1 }}
+          title="全データをCSVでバックアップ"
+        >
+          <Download size={13} style={{ marginRight: 5 }} /> CSVで保存
+        </button>
+        <button
+          onClick={() => setShowSettings((v) => !v)}
+          style={{ ...styles.exportBtn, ...(gasUrl ? {} : { color: '#a89a7d', borderColor: PAPER_LINE }) }}
+          title="スプレッドシート同期の設定"
+        >
+          <Settings size={13} style={{ marginRight: 5 }} /> 同期設定
+        </button>
+      </div>
+      <style>{`.spin-sync { animation: spin 0.9s linear infinite; } @keyframes spin { to { transform: rotate(360deg);} }`}</style>
+    </div>
+  );
+}
+
+function SettingsPanel({ gasUrl, saveGasUrl, expenses, pushToSheet, syncStatus, syncMsg, close }) {
+  const [draft, setDraft] = useState(gasUrl);
+
+  return (
+    <div style={styles.settingsPanel}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+        <div style={styles.cardTitle}>スプレッドシート同期</div>
+        <button onClick={close} style={styles.iconBtn}><X size={15} /></button>
+      </div>
+      <div style={{ fontSize: 12, color: '#8a7b5e', marginBottom: 8 }}>
+        GASのウェブアプリURLを貼ると、記録するたびに自動でスプレッドシートへ反映されます。
+      </div>
+      <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          placeholder="https://script.google.com/macros/s/.../exec"
+          style={{ ...styles.input, flex: 1 }}
+        />
+        <button onClick={() => saveGasUrl(draft.trim())} style={styles.primaryBtn}>
+          <Check size={14} style={{ marginRight: 4 }} /> 保存
+        </button>
+      </div>
+      {gasUrl && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <button
+            onClick={() => pushToSheet(expenses)}
+            disabled={expenses.length === 0}
+            style={{ ...styles.exportBtn, opacity: expenses.length === 0 ? 0.4 : 1 }}
+          >
+            <RefreshCw size={13} style={{ marginRight: 5 }} /> 全件を今すぐ同期
+          </button>
+          {syncStatus !== 'idle' && (
+            <span style={{ fontSize: 11.5, color: syncStatus === 'error' ? STAMP_RED : '#4a7a4f' }}>{syncMsg}</span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function TabBar({ tab, setTab }) {
+  const tabs = [
+    { id: 'input', label: '入力', icon: Plus },
+    { id: 'people', label: '人別', icon: Users },
+    { id: 'monthly', label: '月次・支払い', icon: CalendarDays },
+  ];
+  return (
+    <div style={styles.tabBar}>
+      {tabs.map((t) => {
+        const Icon = t.icon;
+        const active = tab === t.id;
+        return (
+          <button
+            key={t.id}
+            onClick={() => setTab(t.id)}
+            style={{
+              ...styles.tabBtn,
+              ...(active ? styles.tabBtnActive : {}),
+            }}
+          >
+            <Icon size={15} style={{ marginRight: 6 }} />
+            {t.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------- INPUT TAB ----------------
+function InputTab({ people, addPerson, addExpense }) {
+  const [personName, setPersonName] = useState('');
+  const [category, setCategory] = useState(CATEGORIES[0]);
+  const [status, setStatus] = useState('予定');
+  const [amount, setAmount] = useState('');
+  const [date, setDate] = useState(todayStr());
+  const [memo, setMemo] = useState('');
+  const [justAdded, setJustAdded] = useState(false);
+
+  const canSubmit = personName.trim() && amount && Number(amount) > 0 && date;
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (!canSubmit) return;
+    addPerson(personName);
+    addExpense({
+      personName: personName.trim(),
+      category,
+      status,
+      amount: Number(amount),
+      date,
+      memo: memo.trim(),
+    });
+    setAmount('');
+    setMemo('');
+    setJustAdded(true);
+    setTimeout(() => setJustAdded(false), 1400);
+  }
+
+  return (
+    <div>
+      <form onSubmit={handleSubmit} style={styles.card}>
+        <div style={styles.cardTitle}>経費を記録</div>
+
+        <div style={styles.formRow}>
+          <label style={styles.label}>担当者</label>
+          <input
+            list="people-list"
+            value={personName}
+            onChange={(e) => setPersonName(e.target.value)}
+            placeholder="氏名を入力（新規なら自動追加）"
+            style={styles.input}
+          />
+          <datalist id="people-list">
+            {people.map((p) => (
+              <option key={p.id} value={p.name} />
+            ))}
+          </datalist>
+        </div>
+
+        <div style={styles.formRowSplit}>
+          <div style={{ flex: 1 }}>
+            <label style={styles.label}>費目</label>
+            <select value={category} onChange={(e) => setCategory(e.target.value)} style={styles.input}>
+              {CATEGORIES.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={styles.label}>区分</label>
+            <div style={styles.segControl}>
+              {['予定', '確定'].map((s) => (
+                <button
+                  type="button"
+                  key={s}
+                  onClick={() => setStatus(s)}
+                  style={{
+                    ...styles.segBtn,
+                    ...(status === s ? (s === '確定' ? styles.segBtnActiveConfirmed : styles.segBtnActivePlanned) : {}),
+                  }}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div style={styles.formRowSplit}>
+          <div style={{ flex: 1 }}>
+            <label style={styles.label}>金額（円）</label>
+            <input
+              type="number"
+              min="0"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              placeholder="0"
+              style={styles.input}
+            />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={styles.label}>発生日</label>
+            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={styles.input} />
+          </div>
+        </div>
+
+        <div style={styles.formRow}>
+          <label style={styles.label}>メモ（任意）</label>
+          <input
+            value={memo}
+            onChange={(e) => setMemo(e.target.value)}
+            placeholder="例）〇〇交流会 会場費"
+            style={styles.input}
+          />
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 6 }}>
+          <button type="submit" disabled={!canSubmit} style={{ ...styles.primaryBtn, opacity: canSubmit ? 1 : 0.45 }}>
+            <Plus size={15} style={{ marginRight: 4 }} /> 記録する
+          </button>
+          {justAdded && <span style={styles.savedTag}>記録しました</span>}
+        </div>
+
+        {date && (
+          <div style={styles.hint}>
+            この記録は <b>{ymLabel(ymFromDate(date))}締め</b>、支払期日は{' '}
+            <b>{fmtDate(lastDayOfMonth(addMonth(ymFromDate(date))))}</b>（翌月末）になります。
+          </div>
+        )}
+      </form>
+    </div>
+  );
+}
+
+// ---------------- PEOPLE TAB ----------------
+function PeopleTab({ people, expenses, addPerson, removePerson, updateExpense, removeExpense }) {
+  const [newName, setNewName] = useState('');
+  const [openId, setOpenId] = useState(null);
+
+  const byPerson = useMemo(() => {
+    const map = {};
+    for (const p of people) map[p.name] = { person: p, items: [] };
+    for (const e of expenses) {
+      if (!map[e.personName]) map[e.personName] = { person: { id: e.personName, name: e.personName }, items: [] };
+      map[e.personName].items.push(e);
+    }
+    return Object.values(map).sort((a, b) => a.person.name.localeCompare(b.person.name, 'ja'));
+  }, [people, expenses]);
+
+  return (
+    <div>
+      <div style={styles.card}>
+        <div style={styles.cardTitle}>担当者を追加</div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <input
+            value={newName}
+            onChange={(e) => setNewName(e.target.value)}
+            placeholder="氏名"
+            style={{ ...styles.input, flex: 1 }}
+          />
+          <button
+            onClick={() => {
+              addPerson(newName);
+              setNewName('');
+            }}
+            style={styles.primaryBtn}
+          >
+            <Plus size={15} style={{ marginRight: 4 }} /> 追加
+          </button>
+        </div>
+      </div>
+
+      {byPerson.length === 0 && (
+        <EmptyState text="まだ担当者がいません。「入力」タブから記録すると自動で追加されます。" />
+      )}
+
+      {byPerson.map(({ person, items }) => {
+        const planned = items.filter((i) => i.status === '予定').reduce((s, i) => s + i.amount, 0);
+        const confirmed = items.filter((i) => i.status === '確定').reduce((s, i) => s + i.amount, 0);
+        const unpaid = items.filter((i) => i.status === '確定' && !i.paid).reduce((s, i) => s + i.amount, 0);
+        const open = openId === person.id;
+        return (
+          <div key={person.id} style={styles.card}>
+            <div style={styles.personHeaderRow} onClick={() => setOpenId(open ? null : person.id)}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                <span style={styles.personName}>{person.name}</span>
+                <span style={styles.itemCountTag}>{items.length}件</span>
+              </div>
+              <div style={{ display: 'flex', gap: 16, fontSize: 13, alignItems: 'center' }}>
+                <span style={{ color: '#9b8563' }}>予定 {fmtYen(planned)}</span>
+                <span style={{ color: '#8a3b2f', fontWeight: 600 }}>確定 {fmtYen(confirmed)}</span>
+                {unpaid > 0 && <span style={styles.unpaidTag}>未払 {fmtYen(unpaid)}</span>}
+                {people.some((p) => p.id === person.id) && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      if (items.length === 0) removePerson(person.id);
+                    }}
+                    title={items.length ? '記録がある担当者は削除できません' : '削除'}
+                    style={{ ...styles.iconBtn, opacity: items.length ? 0.3 : 1 }}
+                    disabled={items.length > 0}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                )}
+              </div>
+            </div>
+            {open && (
+              <div style={{ marginTop: 10 }}>
+                {items.length === 0 ? (
+                  <div style={{ fontSize: 13, color: '#a89a7d', padding: '8px 0' }}>記録なし</div>
+                ) : (
+                  <ExpenseTable
+                    items={[...items].sort((a, b) => b.date.localeCompare(a.date))}
+                    updateExpense={updateExpense}
+                    removeExpense={removeExpense}
+                    showPerson={false}
+                  />
+                )}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------- MONTHLY TAB ----------------
+function MonthlyTab({ expenses, updateExpense }) {
+  const [openYm, setOpenYm] = useState(null);
+
+  const byMonth = useMemo(() => {
+    const map = {};
+    for (const e of expenses) {
+      const ym = ymFromDate(e.date);
+      if (!map[ym]) map[ym] = [];
+      map[ym].push(e);
+    }
+    return Object.entries(map).sort((a, b) => b[0].localeCompare(a[0]));
+  }, [expenses]);
+
+  if (byMonth.length === 0) {
+    return <EmptyState text="まだ記録がありません。「入力」タブから経費を記録してください。" />;
+  }
+
+  return (
+    <div>
+      <NetworkingFeeTrend byMonth={byMonth} />
+      {byMonth.map(([ym, items]) => {
+        const planned = items.filter((i) => i.status === '予定').reduce((s, i) => s + i.amount, 0);
+        const confirmed = items.filter((i) => i.status === '確定').reduce((s, i) => s + i.amount, 0);
+        const unpaidItems = items.filter((i) => i.status === '確定' && !i.paid);
+        const unpaid = unpaidItems.reduce((s, i) => s + i.amount, 0);
+        const dueDate = lastDayOfMonth(addMonth(ym));
+        const isPastDue = dueDate < todayStr() && unpaid > 0;
+        const open = openYm === ym;
+
+        const byPersonInMonth = {};
+        for (const it of items) {
+          if (!byPersonInMonth[it.personName]) byPersonInMonth[it.personName] = [];
+          byPersonInMonth[it.personName].push(it);
+        }
+
+        return (
+          <div key={ym} style={styles.card}>
+            <div style={styles.personHeaderRow} onClick={() => setOpenYm(open ? null : ym)}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                <span style={styles.personName}>{ymLabel(ym)}締め</span>
+                <span style={{ fontSize: 12, color: isPastDue ? '#a3392c' : '#a89a7d' }}>
+                  支払期日 {fmtDate(dueDate)}{isPastDue ? '（期限超過）' : ''}
+                </span>
+              </div>
+              <div style={{ display: 'flex', gap: 16, fontSize: 13, alignItems: 'center' }}>
+                <span style={{ color: '#9b8563' }}>予定 {fmtYen(planned)}</span>
+                <span style={{ color: '#8a3b2f', fontWeight: 600 }}>確定 {fmtYen(confirmed)}</span>
+                {unpaid > 0 ? (
+                  <span style={isPastDue ? styles.unpaidTagUrgent : styles.unpaidTag}>未払 {fmtYen(unpaid)}</span>
+                ) : (
+                  <span style={styles.paidTag}>支払完了</span>
+                )}
+              </div>
+            </div>
+
+            {open && (
+              <div style={{ marginTop: 12, display: 'flex', flexDirection: 'column', gap: 14 }}>
+                {Object.entries(byPersonInMonth)
+                  .sort((a, b) => a[0].localeCompare(b[0], 'ja'))
+                  .map(([name, list]) => {
+                    const pConfirmed = list.filter((i) => i.status === '確定').reduce((s, i) => s + i.amount, 0);
+                    const pPlanned = list.filter((i) => i.status === '予定').reduce((s, i) => s + i.amount, 0);
+                    return (
+                      <div key={name} style={styles.subBlock}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                          <span style={{ fontWeight: 600, fontSize: 13.5, color: '#3d2f1c' }}>{name}</span>
+                          <span style={{ fontSize: 12.5, color: '#7d6e52' }}>
+                            予定 {fmtYen(pPlanned)} ／ 確定 {fmtYen(pConfirmed)}
+                          </span>
+                        </div>
+                        <ExpenseTable
+                          items={[...list].sort((a, b) => a.date.localeCompare(b.date))}
+                          updateExpense={updateExpense}
+                          removeExpense={() => {}}
+                          showPerson={false}
+                          showPaidToggle
+                          hideDelete
+                        />
+                      </div>
+                    );
+                  })}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function NetworkingFeeTrend({ byMonth }) {
+  const rows = useMemo(() => {
+    return [...byMonth]
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .slice(-6)
+      .map(([ym, items]) => {
+        const fee = items.filter((i) => i.category === '交流会費');
+        return {
+          ym,
+          confirmed: fee.filter((i) => i.status === '確定').reduce((s, i) => s + i.amount, 0),
+          planned: fee.filter((i) => i.status === '予定').reduce((s, i) => s + i.amount, 0),
+        };
+      });
+  }, [byMonth]);
+
+  const max = Math.max(1, ...rows.map((r) => r.confirmed + r.planned));
+
+  if (rows.every((r) => r.confirmed + r.planned === 0)) return null;
+
+  return (
+    <div style={styles.card}>
+      <div style={styles.cardTitle}>交流会費の月次推移（直近{rows.length}か月）</div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+        {rows.map((r) => (
+          <div key={r.ym} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ width: 64, fontSize: 12, color: '#8a7b5e', flexShrink: 0 }}>{ymLabel(r.ym)}</div>
+            <div style={{ flex: 1, background: '#efe9d8', borderRadius: 4, height: 16, overflow: 'hidden', display: 'flex' }}>
+              <div style={{ width: `${(r.confirmed / max) * 100}%`, background: STAMP_RED_TREND }} />
+              <div style={{ width: `${(r.planned / max) * 100}%`, background: '#d9c39a' }} />
+            </div>
+            <div style={{ width: 96, textAlign: 'right', fontSize: 12, color: '#5c4a2a', flexShrink: 0 }}>
+              {fmtYen(r.confirmed + r.planned)}
+            </div>
+          </div>
+        ))}
+      </div>
+      <div style={{ display: 'flex', gap: 14, marginTop: 10, fontSize: 11, color: '#8a7b5e' }}>
+        <span><span style={{ display: 'inline-block', width: 9, height: 9, background: STAMP_RED_TREND, borderRadius: 2, marginRight: 4 }} />確定</span>
+        <span><span style={{ display: 'inline-block', width: 9, height: 9, background: '#d9c39a', borderRadius: 2, marginRight: 4 }} />予定</span>
+      </div>
+    </div>
+  );
+}
+
+// ---------------- SHARED: EXPENSE TABLE ----------------
+function ExpenseTable({ items, updateExpense, removeExpense, showPerson, showPaidToggle, hideDelete }) {
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th style={styles.th}>日付</th>
+          {showPerson && <th style={styles.th}>担当者</th>}
+          <th style={styles.th}>費目</th>
+          <th style={{ ...styles.th, textAlign: 'right' }}>金額</th>
+          <th style={styles.th}>区分</th>
+          <th style={styles.th}>メモ</th>
+          {showPaidToggle && <th style={styles.th}>支払</th>}
+          {!hideDelete && <th style={styles.th}></th>}
+        </tr>
+      </thead>
+      <tbody>
+        {items.map((it) => (
+          <tr key={it.id} style={styles.tr}>
+            <td style={styles.td}>{fmtDate(it.date)}</td>
+            {showPerson && <td style={styles.td}>{it.personName}</td>}
+            <td style={styles.td}>{it.category}</td>
+            <td style={{ ...styles.td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{fmtYen(it.amount)}</td>
+            <td style={styles.td}>
+              <button
+                onClick={() => updateExpense(it.id, { status: it.status === '予定' ? '確定' : '予定' })}
+                style={it.status === '確定' ? styles.hankoStamp : styles.plannedStamp}
+                title="クリックで区分を切替"
+              >
+                {it.status}
+              </button>
+            </td>
+            <td style={{ ...styles.td, color: '#8a7b5e' }}>{it.memo || '—'}</td>
+            {showPaidToggle && (
+              <td style={styles.td}>
+                {it.status === '確定' ? (
+                  <button
+                    onClick={() => updateExpense(it.id, { paid: !it.paid })}
+                    style={it.paid ? styles.paidBtnDone : styles.paidBtnPending}
+                  >
+                    {it.paid ? <Check size={12} /> : null} {it.paid ? '済' : '未払'}
+                  </button>
+                ) : (
+                  <span style={{ color: '#c9bd9e', fontSize: 12 }}>—</span>
+                )}
+              </td>
+            )}
+            {!hideDelete && (
+              <td style={styles.td}>
+                <button onClick={() => removeExpense(it.id)} style={styles.iconBtn} title="削除">
+                  <Trash2 size={13} />
+                </button>
+              </td>
+            )}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function EmptyState({ text }) {
+  return (
+    <div style={styles.emptyState}>
+      <Wallet size={24} style={{ color: '#c9bd9e', marginBottom: 8 }} />
+      <div style={{ fontSize: 13.5, color: '#a89a7d' }}>{text}</div>
+    </div>
+  );
+}
+
+// ---------------- STYLES ----------------
+const INK = '#3d2f1c';
+const PAPER = '#f7f2e7';
+const PAPER_LINE = '#e4d9bd';
+const STAMP_RED = '#a3392c';
+const GOLD = '#8a6a3b';
+const STAMP_RED_TREND = '#b3564a';
+
+const styles = {
+  app: {
+    fontFamily: "'Hiragino Kaku Gothic ProN', 'Hiragino Sans', 'Noto Sans JP', 'Yu Gothic', sans-serif",
+    background: PAPER,
+    color: INK,
+    minHeight: '100%',
+    padding: 0,
+    fontSize: 14,
+    lineHeight: 1.5,
+  },
+  loadingWrap: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 10,
+    padding: '48px 0',
+  },
+  header: {
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    padding: '16px 18px 12px',
+    borderBottom: `2px solid ${PAPER_LINE}`,
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  headerInner: { display: 'flex', alignItems: 'center', gap: 12 },
+  hankoMark: {
+    width: 40,
+    height: 40,
+    borderRadius: '50%',
+    border: `2px solid ${STAMP_RED}`,
+    color: STAMP_RED,
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontWeight: 700,
+    fontSize: 13,
+    letterSpacing: -1,
+    flexShrink: 0,
+    transform: 'rotate(-4deg)',
+  },
+  title: { fontSize: 17, fontWeight: 700, letterSpacing: 0.5 },
+  subtitle: { fontSize: 11.5, color: '#8a7b5e', marginTop: 2 },
+  exportBtn: {
+    display: 'flex',
+    alignItems: 'center',
+    padding: '6px 11px',
+    background: '#fffdf8',
+    border: `1px solid ${GOLD}`,
+    color: GOLD,
+    borderRadius: 7,
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  settingsPanel: {
+    background: '#fbf7ec',
+    borderBottom: `1px solid ${PAPER_LINE}`,
+    padding: '14px 18px',
+    maxWidth: 880,
+    margin: '0 auto',
+  },
+  saveErrorBadge: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 5,
+    fontSize: 11.5,
+    color: STAMP_RED,
+    background: '#f6e3df',
+    padding: '4px 9px',
+    borderRadius: 6,
+  },
+  tabBar: {
+    display: 'flex',
+    gap: 4,
+    padding: '10px 18px 0',
+    borderBottom: `1px solid ${PAPER_LINE}`,
+  },
+  tabBtn: {
+    display: 'flex',
+    alignItems: 'center',
+    padding: '8px 14px',
+    border: 'none',
+    background: 'transparent',
+    borderRadius: '8px 8px 0 0',
+    color: '#8a7b5e',
+    fontSize: 13.5,
+    cursor: 'pointer',
+    borderBottom: '2px solid transparent',
+    fontWeight: 500,
+  },
+  tabBtnActive: {
+    color: INK,
+    background: '#fffdf8',
+    borderBottom: `2px solid ${GOLD}`,
+    fontWeight: 700,
+  },
+  body: { padding: 16, maxWidth: 880, margin: '0 auto' },
+  card: {
+    background: '#fffdf8',
+    border: `1px solid ${PAPER_LINE}`,
+    borderRadius: 10,
+    padding: 16,
+    marginBottom: 14,
+    boxShadow: '0 1px 2px rgba(60,45,20,0.04)',
+  },
+  cardTitle: { fontSize: 13.5, fontWeight: 700, marginBottom: 12, color: '#5c4a2a' },
+  formRow: { marginBottom: 12 },
+  formRowSplit: { display: 'flex', gap: 12, marginBottom: 12 },
+  label: { display: 'block', fontSize: 11.5, color: '#8a7b5e', marginBottom: 4, fontWeight: 600 },
+  input: {
+    width: '100%',
+    padding: '8px 10px',
+    border: `1px solid ${PAPER_LINE}`,
+    borderRadius: 6,
+    background: '#fffefb',
+    fontSize: 13.5,
+    color: INK,
+  },
+  segControl: {
+    display: 'flex',
+    border: `1px solid ${PAPER_LINE}`,
+    borderRadius: 6,
+    overflow: 'hidden',
+  },
+  segBtn: {
+    flex: 1,
+    padding: '8px 0',
+    border: 'none',
+    background: '#fffefb',
+    color: '#a89a7d',
+    fontSize: 13,
+    cursor: 'pointer',
+    fontWeight: 600,
+  },
+  segBtnActivePlanned: { background: '#efe6d1', color: '#8a6a3b' },
+  segBtnActiveConfirmed: { background: '#f3ded9', color: STAMP_RED },
+  primaryBtn: {
+    display: 'flex',
+    alignItems: 'center',
+    padding: '9px 16px',
+    background: INK,
+    color: '#fff',
+    border: 'none',
+    borderRadius: 7,
+    fontSize: 13.5,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  savedTag: { fontSize: 12.5, color: '#4a7a4f' },
+  hint: {
+    marginTop: 12,
+    fontSize: 12,
+    color: '#8a7b5e',
+    background: '#efe9d8',
+    padding: '8px 10px',
+    borderRadius: 6,
+  },
+  personHeaderRow: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    cursor: 'pointer',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  personName: { fontWeight: 700, fontSize: 14.5 },
+  itemCountTag: {
+    fontSize: 11,
+    color: '#a89a7d',
+    background: '#efe9d8',
+    borderRadius: 10,
+    padding: '1px 8px',
+  },
+  unpaidTag: {
+    fontSize: 11.5,
+    color: STAMP_RED,
+    background: '#f6e3df',
+    padding: '3px 9px',
+    borderRadius: 10,
+    fontWeight: 600,
+  },
+  unpaidTagUrgent: {
+    fontSize: 11.5,
+    color: '#fff',
+    background: STAMP_RED,
+    padding: '3px 9px',
+    borderRadius: 10,
+    fontWeight: 700,
+  },
+  paidTag: {
+    fontSize: 11.5,
+    color: '#4a7a4f',
+    background: '#e2ecd9',
+    padding: '3px 9px',
+    borderRadius: 10,
+    fontWeight: 600,
+  },
+  subBlock: {
+    background: '#fbf7ec',
+    border: `1px solid ${PAPER_LINE}`,
+    borderRadius: 8,
+    padding: 10,
+  },
+  th: {
+    textAlign: 'left',
+    fontSize: 11,
+    color: '#a89a7d',
+    fontWeight: 600,
+    padding: '4px 8px',
+    borderBottom: `1px solid ${PAPER_LINE}`,
+  },
+  tr: {},
+  td: {
+    padding: '7px 8px',
+    fontSize: 12.5,
+    borderBottom: `1px solid ${PAPER_LINE}`,
+    verticalAlign: 'middle',
+  },
+  hankoStamp: {
+    border: `1.5px solid ${STAMP_RED}`,
+    color: STAMP_RED,
+    background: 'transparent',
+    borderRadius: 5,
+    padding: '2px 8px',
+    fontSize: 11.5,
+    fontWeight: 700,
+    cursor: 'pointer',
+  },
+  plannedStamp: {
+    border: `1.5px dashed #b3a274`,
+    color: '#8a7b5e',
+    background: 'transparent',
+    borderRadius: 5,
+    padding: '2px 8px',
+    fontSize: 11.5,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  paidBtnDone: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 3,
+    border: 'none',
+    background: '#e2ecd9',
+    color: '#4a7a4f',
+    borderRadius: 5,
+    padding: '2px 8px',
+    fontSize: 11.5,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  paidBtnPending: {
+    border: 'none',
+    background: '#f3ded9',
+    color: STAMP_RED,
+    borderRadius: 5,
+    padding: '2px 8px',
+    fontSize: 11.5,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  iconBtn: {
+    border: 'none',
+    background: 'transparent',
+    color: '#b3a274',
+    cursor: 'pointer',
+    padding: 4,
+  },
+  emptyState: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'center',
+    padding: '32px 0',
+  },
+};
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<ExpenseTracker />);
+</script>
+</body>
+</html>
