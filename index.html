@@ -67,6 +67,8 @@ const Download = makeIcon('⬇');
 const Settings = makeIcon('⚙');
 const RefreshCw = makeIcon('↻');
 const CheckCircle2 = makeIcon('✅');
+const Target = makeIcon('🎯');
+const Building2 = makeIcon('🏢');
 
 
 const CATEGORIES = ['交流会費', '交通費', 'その他'];
@@ -91,16 +93,32 @@ function toSyncRecord(e) {
   };
 }
 
-async function syncToSheet(gasUrl, records) {
+function toSyncMemberRecord(m) {
+  return {
+    id: m.id,
+    companyName: m.companyName,
+    personName: m.personName,
+    contractStart: m.contractStart,
+    contractEnd: m.contractEnd || '',
+    joinFee: m.joinFee || 0,
+    rewardFee: m.rewardFee || 0,
+    memo: m.memo || '',
+  };
+}
+
+async function syncToSheet(gasUrl, kind, records, mapFn) {
   if (!gasUrl) return { ok: false, error: '同期URL未設定' };
   try {
-    const res = await fetch(gasUrl, {
+    await fetch(gasUrl, {
       method: 'POST',
+      mode: 'no-cors', // Apps Script web apps redirect through googleusercontent.com without
+                        // CORS headers, so a normal fetch reports a network error even when
+                        // the write actually succeeds. no-cors avoids that false failure —
+                        // the trade-off is we can no longer read the JSON result back.
       headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-      body: JSON.stringify({ records: records.map(toSyncRecord) }),
+      body: JSON.stringify({ kind, records: records.map(mapFn) }),
     });
-    const json = await res.json();
-    return json;
+    return { ok: true, opaque: true };
   } catch (err) {
     return { ok: false, error: String(err) };
   }
@@ -169,9 +187,53 @@ function downloadCSV(expenses) {
   URL.revokeObjectURL(url);
 }
 
+function rate(num, den) {
+  return den > 0 ? Math.round((num / den) * 100) : null;
+}
+
+function downloadFunnelCSV(funnels) {
+  const header = ['参加日', '対象月', '担当者', '交流会名', 'メモ'];
+  const rows = [...funnels]
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .map((f) => [fmtDate(f.date), ymLabel(ymFromDate(f.date)), f.personName, f.eventName, (f.memo || '').replace(/[\n,]/g, ' ')]);
+  const csv = [header, ...rows].map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
+  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `交流会参加履歴_${todayStr()}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function downloadMemberCSV(members) {
+  const header = ['企業名', '紹介担当者', '契約開始日', '契約終了日', '入会金', '成果報酬金', 'メモ'];
+  const rows = [...members]
+    .sort((a, b) => a.contractStart.localeCompare(b.contractStart))
+    .map((m) => [
+      m.companyName, m.personName, fmtDate(m.contractStart), m.contractEnd ? fmtDate(m.contractEnd) : '',
+      m.joinFee || 0, m.rewardFee || 0, (m.memo || '').replace(/[\n,]/g, ' '),
+    ]);
+  const csv = [header, ...rows].map((r) => r.map((v) => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\r\n');
+  const blob = new Blob(['\uFEFF' + csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `入会企業一覧_${todayStr()}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+
 function ExpenseTracker() {
   const [people, setPeople] = useState([]);
   const [expenses, setExpenses] = useState([]);
+  const [funnels, setFunnels] = useState([]);
+  const [members, setMembers] = useState([]);
   const [loaded, setLoaded] = useState(false);
   const [saveError, setSaveError] = useState(false);
   const [tab, setTab] = useState('input');
@@ -189,6 +251,8 @@ function ExpenseTracker() {
           const parsed = JSON.parse(res.value);
           setPeople(parsed.people || []);
           setExpenses(parsed.expenses || []);
+          setFunnels(parsed.funnels || []);
+          setMembers(parsed.members || []);
         }
       } catch (e) {
         // no existing data yet — fine
@@ -211,7 +275,7 @@ function ExpenseTracker() {
       try {
         const result = await window.storage.set(
           STORAGE_KEY,
-          JSON.stringify({ people, expenses }),
+          JSON.stringify({ people, expenses, funnels, members }),
           false
         );
         setSaveError(!result);
@@ -219,7 +283,7 @@ function ExpenseTracker() {
         setSaveError(true);
       }
     })();
-  }, [people, expenses, loaded]);
+  }, [people, expenses, funnels, members, loaded]);
 
   async function saveGasUrl(url) {
     setGasUrl(url);
@@ -230,16 +294,16 @@ function ExpenseTracker() {
     }
   }
 
-  async function pushToSheet(records) {
+  async function pushToSheet(kind, records, mapFn) {
     if (!gasUrl) return;
     setSyncStatus('syncing');
-    const result = await syncToSheet(gasUrl, records);
+    const result = await syncToSheet(gasUrl, kind, records, mapFn);
     if (result && result.ok) {
       setSyncStatus('ok');
-      setSyncMsg(`${new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })} 同期済み`);
+      setSyncMsg(`${new Date().toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })} 送信済み（要確認）`);
     } else {
       setSyncStatus('error');
-      setSyncMsg((result && result.error) || '同期に失敗しました');
+      setSyncMsg((result && result.error) || '送信に失敗しました（URL/公開設定を確認）');
     }
   }
 
@@ -257,7 +321,7 @@ function ExpenseTracker() {
   function addExpense(exp) {
     const record = { id: uid(), paid: false, ...exp };
     setExpenses((prev) => [...prev, record]);
-    if (gasUrl) pushToSheet([record]);
+    if (gasUrl) pushToSheet('expense', [record], toSyncRecord);
   }
 
   function updateExpense(id, patch) {
@@ -265,7 +329,7 @@ function ExpenseTracker() {
       const next = prev.map((e) => (e.id === id ? { ...e, ...patch } : e));
       if (gasUrl) {
         const updated = next.find((e) => e.id === id);
-        if (updated) pushToSheet([updated]);
+        if (updated) pushToSheet('expense', [updated], toSyncRecord);
       }
       return next;
     });
@@ -273,6 +337,28 @@ function ExpenseTracker() {
 
   function removeExpense(id) {
     setExpenses((prev) => prev.filter((e) => e.id !== id));
+  }
+
+  function addFunnel(f) {
+    setFunnels((prev) => [...prev, { id: uid(), ...f }]);
+  }
+
+  function updateFunnel(id, patch) {
+    setFunnels((prev) => prev.map((f) => (f.id === id ? { ...f, ...patch } : f)));
+  }
+
+  function removeFunnel(id) {
+    setFunnels((prev) => prev.filter((f) => f.id !== id));
+  }
+
+  function addMember(m) {
+    const record = { id: uid(), ...m };
+    setMembers((prev) => [...prev, record]);
+    if (gasUrl) pushToSheet('member', [record], toSyncMemberRecord);
+  }
+
+  function removeMember(id) {
+    setMembers((prev) => prev.filter((m) => m.id !== id));
   }
 
   if (!loaded) {
@@ -310,6 +396,7 @@ function ExpenseTracker() {
           gasUrl={gasUrl}
           saveGasUrl={saveGasUrl}
           expenses={expenses}
+          members={members}
           pushToSheet={pushToSheet}
           syncStatus={syncStatus}
           syncMsg={syncMsg}
@@ -335,6 +422,24 @@ function ExpenseTracker() {
         {tab === 'monthly' && (
           <MonthlyTab expenses={expenses} updateExpense={updateExpense} />
         )}
+        {tab === 'funnel' && (
+          <FunnelTab
+            people={people}
+            funnels={funnels}
+            addPerson={addPerson}
+            addFunnel={addFunnel}
+            removeFunnel={removeFunnel}
+          />
+        )}
+        {tab === 'members' && (
+          <MembersTab
+            people={people}
+            members={members}
+            addPerson={addPerson}
+            addMember={addMember}
+            removeMember={removeMember}
+          />
+        )}
       </div>
     </div>
   );
@@ -346,8 +451,8 @@ function Header({ saveError, expenses, gasUrl, syncStatus, syncMsg, showSettings
       <div style={styles.headerInner}>
         <div style={styles.hankoMark}>精算</div>
         <div>
-          <div style={styles.title}>経費精算台帳</div>
-          <div style={styles.subtitle}>交流会費・交通費 / 月末締め・翌月末払い</div>
+          <div style={styles.title}>個人用管理台帳</div>
+          <div style={styles.subtitle}>経費精算（交流会費・交通費）／入会企業の管理</div>
         </div>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
@@ -385,7 +490,7 @@ function Header({ saveError, expenses, gasUrl, syncStatus, syncMsg, showSettings
   );
 }
 
-function SettingsPanel({ gasUrl, saveGasUrl, expenses, pushToSheet, syncStatus, syncMsg, close }) {
+function SettingsPanel({ gasUrl, saveGasUrl, expenses, members, pushToSheet, syncStatus, syncMsg, close }) {
   const [draft, setDraft] = useState(gasUrl);
 
   return (
@@ -395,7 +500,7 @@ function SettingsPanel({ gasUrl, saveGasUrl, expenses, pushToSheet, syncStatus, 
         <button onClick={close} style={styles.iconBtn}><X size={15} /></button>
       </div>
       <div style={{ fontSize: 12, color: '#8a7b5e', marginBottom: 8 }}>
-        GASのウェブアプリURLを貼ると、記録するたびに自動でスプレッドシートへ反映されます。
+        GASのウェブアプリURLを貼ると、経費と入会企業（成果報酬含む）が記録するたびに自動でスプレッドシートへ反映されます（それぞれ別シートになります）。
       </div>
       <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
         <input
@@ -409,13 +514,20 @@ function SettingsPanel({ gasUrl, saveGasUrl, expenses, pushToSheet, syncStatus, 
         </button>
       </div>
       {gasUrl && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <button
-            onClick={() => pushToSheet(expenses)}
+            onClick={() => pushToSheet('expense', expenses, toSyncRecord)}
             disabled={expenses.length === 0}
             style={{ ...styles.exportBtn, opacity: expenses.length === 0 ? 0.4 : 1 }}
           >
-            <RefreshCw size={13} style={{ marginRight: 5 }} /> 全件を今すぐ同期
+            <RefreshCw size={13} style={{ marginRight: 5 }} /> 経費を今すぐ同期
+          </button>
+          <button
+            onClick={() => pushToSheet('member', members, toSyncMemberRecord)}
+            disabled={members.length === 0}
+            style={{ ...styles.exportBtn, opacity: members.length === 0 ? 0.4 : 1 }}
+          >
+            <RefreshCw size={13} style={{ marginRight: 5 }} /> 入会企業を今すぐ同期
           </button>
           {syncStatus !== 'idle' && (
             <span style={{ fontSize: 11.5, color: syncStatus === 'error' ? STAMP_RED : '#4a7a4f' }}>{syncMsg}</span>
@@ -428,9 +540,11 @@ function SettingsPanel({ gasUrl, saveGasUrl, expenses, pushToSheet, syncStatus, 
 
 function TabBar({ tab, setTab }) {
   const tabs = [
-    { id: 'input', label: '入力', icon: Plus },
+    { id: 'input', label: '経費入力', icon: Plus },
     { id: 'people', label: '人別', icon: Users },
     { id: 'monthly', label: '月次・支払い', icon: CalendarDays },
+    { id: 'funnel', label: '交流会実績', icon: Target },
+    { id: 'members', label: '入会企業', icon: Building2 },
   ];
   return (
     <div style={styles.tabBar}>
@@ -812,6 +926,483 @@ function NetworkingFeeTrend({ byMonth }) {
   );
 }
 
+// ---------------- REVENUE TAB (業務委託) ----------------
+// ---------------- FUNNEL TAB (交流会実績) ----------------
+function FunnelTab({ people, funnels, addPerson, addFunnel, removeFunnel }) {
+  const [view, setView] = useState('monthly'); // monthly | person
+  const [personName, setPersonName] = useState('');
+  const [eventName, setEventName] = useState('');
+  const [date, setDate] = useState(todayStr());
+  const [memo, setMemo] = useState('');
+  const [justAdded, setJustAdded] = useState(false);
+  const [openKey, setOpenKey] = useState(null);
+
+  const canSubmit = personName.trim() && eventName.trim() && date;
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (!canSubmit) return;
+    addPerson(personName);
+    addFunnel({
+      personName: personName.trim(),
+      eventName: eventName.trim(),
+      date,
+      memo: memo.trim(),
+    });
+    setEventName('');
+    setMemo('');
+    setJustAdded(true);
+    setTimeout(() => setJustAdded(false), 1400);
+  }
+
+  const byMonth = useMemo(() => {
+    const map = {};
+    for (const f of funnels) {
+      const ym = ymFromDate(f.date);
+      if (!map[ym]) map[ym] = [];
+      map[ym].push(f);
+    }
+    return Object.entries(map).sort((a, b) => b[0].localeCompare(a[0]));
+  }, [funnels]);
+
+  const byPerson = useMemo(() => {
+    const map = {};
+    for (const f of funnels) {
+      if (!map[f.personName]) map[f.personName] = [];
+      map[f.personName].push(f);
+    }
+    return Object.entries(map).sort((a, b) => a[0].localeCompare(b[0], 'ja'));
+  }, [funnels]);
+
+  return (
+    <div>
+      <form onSubmit={handleSubmit} style={styles.card}>
+        <div style={styles.cardTitle}>参加した交流会を記録</div>
+        <div style={{ fontSize: 12, color: '#8a7b5e', marginBottom: 12 }}>
+          どの交流会に、誰が、いつ参加したかだけを記録します。月にどれくらい参加しているかはここで見られます。
+        </div>
+
+        <div style={styles.formRowSplit}>
+          <div style={{ flex: 1 }}>
+            <label style={styles.label}>担当者</label>
+            <input
+              list="people-list-funnel"
+              value={personName}
+              onChange={(e) => setPersonName(e.target.value)}
+              placeholder="氏名を入力（新規なら自動追加）"
+              style={styles.input}
+            />
+            <datalist id="people-list-funnel">
+              {people.map((p) => (
+                <option key={p.id} value={p.name} />
+              ))}
+            </datalist>
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={styles.label}>交流会名</label>
+            <input value={eventName} onChange={(e) => setEventName(e.target.value)} placeholder="例）〇〇交流会" style={styles.input} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={styles.label}>参加日</label>
+            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={styles.input} />
+          </div>
+        </div>
+
+        <div style={styles.formRow}>
+          <label style={styles.label}>メモ（任意）</label>
+          <input value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="任意" style={styles.input} />
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <button type="submit" disabled={!canSubmit} style={{ ...styles.primaryBtn, opacity: canSubmit ? 1 : 0.45 }}>
+            <Plus size={15} style={{ marginRight: 4 }} /> 記録する
+          </button>
+          {justAdded && <span style={styles.savedTag}>記録しました</span>}
+          <button
+            type="button"
+            onClick={() => downloadFunnelCSV(funnels)}
+            disabled={funnels.length === 0}
+            style={{ ...styles.exportBtn, opacity: funnels.length === 0 ? 0.4 : 1, marginLeft: 'auto' }}
+          >
+            <Download size={13} style={{ marginRight: 5 }} /> CSVで保存
+          </button>
+        </div>
+      </form>
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+        <button
+          onClick={() => setView('monthly')}
+          style={{ ...styles.viewToggleBtn, ...(view === 'monthly' ? styles.viewToggleBtnActive : {}) }}
+        >
+          <CalendarDays size={13} style={{ marginRight: 5 }} /> 月次で見る
+        </button>
+        <button
+          onClick={() => setView('person')}
+          style={{ ...styles.viewToggleBtn, ...(view === 'person' ? styles.viewToggleBtnActive : {}) }}
+        >
+          <Users size={13} style={{ marginRight: 5 }} /> 人別で見る
+        </button>
+      </div>
+
+      {funnels.length === 0 && <EmptyState text="まだ参加履歴がありません。上のフォームから記録してください。" />}
+
+      {view === 'monthly' &&
+        byMonth.map(([m, items]) => {
+          const open = openKey === m;
+          return (
+            <div key={m} style={styles.card}>
+              <div style={styles.personHeaderRow} onClick={() => setOpenKey(open ? null : m)}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                  <span style={styles.personName}>{ymLabel(m)}</span>
+                </div>
+                <span style={styles.itemCountTag}>参加 {items.length}件</span>
+              </div>
+              {open && (
+                <div style={{ marginTop: 10 }}>
+                  <FunnelTable
+                    items={[...items].sort((a, b) => a.date.localeCompare(b.date))}
+                    removeFunnel={removeFunnel}
+                    showPerson
+                    showEvent
+                  />
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+      {view === 'person' &&
+        byPerson.map(([name, items]) => {
+          const open = openKey === name;
+          // participation count broken down per month for this person
+          const monthCounts = {};
+          for (const it of items) {
+            const ym = ymFromDate(it.date);
+            monthCounts[ym] = (monthCounts[ym] || 0) + 1;
+          }
+          const monthBreakdown = Object.entries(monthCounts).sort((a, b) => b[0].localeCompare(a[0]));
+          return (
+            <div key={name} style={styles.card}>
+              <div style={styles.personHeaderRow} onClick={() => setOpenKey(open ? null : name)}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                  <span style={styles.personName}>{name}</span>
+                </div>
+                <span style={styles.itemCountTag}>累計 {items.length}件</span>
+              </div>
+              {open && (
+                <div style={{ marginTop: 10 }}>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 10 }}>
+                    {monthBreakdown.map(([ym, count]) => (
+                      <span key={ym} style={styles.monthCountChip}>{ymLabel(ym)} {count}件</span>
+                    ))}
+                  </div>
+                  <FunnelTable
+                    items={[...items].sort((a, b) => b.date.localeCompare(a.date))}
+                    removeFunnel={removeFunnel}
+                    showEvent
+                  />
+                </div>
+              )}
+            </div>
+          );
+        })}
+    </div>
+  );
+}
+
+function FunnelTable({ items, removeFunnel, showPerson, showEvent }) {
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th style={styles.th}>参加日</th>
+          {showPerson && <th style={styles.th}>担当者</th>}
+          {showEvent && <th style={styles.th}>交流会名</th>}
+          <th style={styles.th}>メモ</th>
+          <th style={styles.th}></th>
+        </tr>
+      </thead>
+      <tbody>
+        {items.map((f) => (
+          <tr key={f.id} style={styles.tr}>
+            <td style={styles.td}>{fmtDate(f.date)}</td>
+            {showPerson && <td style={styles.td}>{f.personName}</td>}
+            {showEvent && <td style={styles.td}>{f.eventName}</td>}
+            <td style={{ ...styles.td, color: '#8a7b5e' }}>{f.memo || '—'}</td>
+            <td style={styles.td}>
+              <button onClick={() => removeFunnel(f.id)} style={styles.iconBtn} title="削除">
+                <Trash2 size={13} />
+              </button>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+// ---------------- MEMBERS TAB (入会企業) ----------------
+function MembersTab({ people, members, addPerson, addMember, removeMember }) {
+  const [view, setView] = useState('monthly'); // monthly | person
+  const [companyName, setCompanyName] = useState('');
+  const [personName, setPersonName] = useState('');
+  const [contractStart, setContractStart] = useState(todayStr());
+  const [contractEnd, setContractEnd] = useState('');
+  const [joinFee, setJoinFee] = useState('');
+  const [rewardFee, setRewardFee] = useState('');
+  const [memo, setMemo] = useState('');
+  const [justAdded, setJustAdded] = useState(false);
+  const [openKey, setOpenKey] = useState(null);
+
+  const canSubmit = companyName.trim() && personName.trim() && contractStart;
+
+  function handleSubmit(e) {
+    e.preventDefault();
+    if (!canSubmit) return;
+    addPerson(personName);
+    addMember({
+      companyName: companyName.trim(),
+      personName: personName.trim(),
+      contractStart,
+      contractEnd,
+      joinFee: Number(joinFee) || 0,
+      rewardFee: Number(rewardFee) || 0,
+      memo: memo.trim(),
+    });
+    setCompanyName('');
+    setContractEnd('');
+    setJoinFee('');
+    setRewardFee('');
+    setMemo('');
+    setJustAdded(true);
+    setTimeout(() => setJustAdded(false), 1400);
+  }
+
+  const byMonth = useMemo(() => {
+    const map = {};
+    for (const m of members) {
+      const ym = ymFromDate(m.contractStart);
+      if (!map[ym]) map[ym] = [];
+      map[ym].push(m);
+    }
+    return Object.entries(map).sort((a, b) => b[0].localeCompare(a[0]));
+  }, [members]);
+
+  const byPerson = useMemo(() => {
+    const map = {};
+    for (const m of members) {
+      if (!map[m.personName]) map[m.personName] = [];
+      map[m.personName].push(m);
+    }
+    return Object.entries(map).sort((a, b) => a[0].localeCompare(b[0], 'ja'));
+  }, [members]);
+
+  function GroupSummary({ items }) {
+    const joinFeeSum = items.reduce((s, i) => s + (i.joinFee || 0), 0);
+    const rewardSum = items.reduce((s, i) => s + (i.rewardFee || 0), 0);
+    return (
+      <div style={{ display: 'flex', gap: 14, fontSize: 12.5, alignItems: 'center', flexWrap: 'wrap' }}>
+        <span style={styles.itemCountTag}>{items.length}社</span>
+        <span style={{ color: '#3d6b4a', fontWeight: 600 }}>入会金 {fmtYen(joinFeeSum)}</span>
+        <span style={{ color: STAMP_RED, fontWeight: 600 }}>成果報酬 {fmtYen(rewardSum)}</span>
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <form onSubmit={handleSubmit} style={styles.card}>
+        <div style={styles.cardTitle}>入会企業を記録</div>
+        <div style={{ fontSize: 12, color: '#8a7b5e', marginBottom: 12 }}>
+          どの会社が、誰の紹介で、どんな契約で入会したかを記録します。
+        </div>
+
+        <div style={styles.formRowSplit}>
+          <div style={{ flex: 1 }}>
+            <label style={styles.label}>企業名</label>
+            <input
+              value={companyName}
+              onChange={(e) => setCompanyName(e.target.value)}
+              placeholder="例）株式会社〇〇"
+              style={styles.input}
+            />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={styles.label}>紹介担当者</label>
+            <input
+              list="people-list-members"
+              value={personName}
+              onChange={(e) => setPersonName(e.target.value)}
+              placeholder="氏名を入力（新規なら自動追加）"
+              style={styles.input}
+            />
+            <datalist id="people-list-members">
+              {people.map((p) => (
+                <option key={p.id} value={p.name} />
+              ))}
+            </datalist>
+          </div>
+        </div>
+
+        <div style={styles.formRowSplit}>
+          <div style={{ flex: 1 }}>
+            <label style={styles.label}>契約開始日</label>
+            <input type="date" value={contractStart} onChange={(e) => setContractStart(e.target.value)} style={styles.input} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={styles.label}>契約終了日（任意）</label>
+            <input type="date" value={contractEnd} onChange={(e) => setContractEnd(e.target.value)} style={styles.input} />
+          </div>
+        </div>
+
+        <div style={styles.formRowSplit}>
+          <div style={{ flex: 1 }}>
+            <label style={styles.label}>入会金（円）</label>
+            <input type="number" min="0" value={joinFee} onChange={(e) => setJoinFee(e.target.value)} placeholder="0" style={styles.input} />
+          </div>
+          <div style={{ flex: 1 }}>
+            <label style={styles.label}>成果報酬金（円）</label>
+            <input type="number" min="0" value={rewardFee} onChange={(e) => setRewardFee(e.target.value)} placeholder="0" style={styles.input} />
+          </div>
+        </div>
+
+        <div style={styles.formRow}>
+          <label style={styles.label}>メモ（任意）</label>
+          <input value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="例）プラン名など" style={styles.input} />
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <button type="submit" disabled={!canSubmit} style={{ ...styles.primaryBtn, opacity: canSubmit ? 1 : 0.45 }}>
+            <Plus size={15} style={{ marginRight: 4 }} /> 記録する
+          </button>
+          {justAdded && <span style={styles.savedTag}>記録しました</span>}
+          <button
+            type="button"
+            onClick={() => downloadMemberCSV(members)}
+            disabled={members.length === 0}
+            style={{ ...styles.exportBtn, opacity: members.length === 0 ? 0.4 : 1, marginLeft: 'auto' }}
+          >
+            <Download size={13} style={{ marginRight: 5 }} /> CSVで保存
+          </button>
+        </div>
+      </form>
+
+      {members.length > 0 && (
+        <div style={{ ...styles.card, background: '#fbf7ec' }}>
+          <div style={styles.cardTitle}>累計サマリー</div>
+          <GroupSummary items={members} />
+        </div>
+      )}
+
+      <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+        <button
+          onClick={() => setView('monthly')}
+          style={{ ...styles.viewToggleBtn, ...(view === 'monthly' ? styles.viewToggleBtnActive : {}) }}
+        >
+          <CalendarDays size={13} style={{ marginRight: 5 }} /> 月次で見る
+        </button>
+        <button
+          onClick={() => setView('person')}
+          style={{ ...styles.viewToggleBtn, ...(view === 'person' ? styles.viewToggleBtnActive : {}) }}
+        >
+          <Users size={13} style={{ marginRight: 5 }} /> 担当者別で見る
+        </button>
+      </div>
+
+      {members.length === 0 && <EmptyState text="まだ入会企業がありません。上のフォームから記録してください。" />}
+
+      {view === 'monthly' &&
+        byMonth.map(([m, items]) => {
+          const open = openKey === m;
+          return (
+            <div key={m} style={styles.card}>
+              <div style={styles.personHeaderRow} onClick={() => setOpenKey(open ? null : m)}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                  <span style={styles.personName}>{ymLabel(m)}</span>
+                </div>
+                <GroupSummary items={items} />
+              </div>
+              {open && (
+                <div style={{ marginTop: 10 }}>
+                  <MembersTable
+                    items={[...items].sort((a, b) => a.contractStart.localeCompare(b.contractStart))}
+                    removeMember={removeMember}
+                    showPerson
+                  />
+                </div>
+              )}
+            </div>
+          );
+        })}
+
+      {view === 'person' &&
+        byPerson.map(([name, items]) => {
+          const open = openKey === name;
+          return (
+            <div key={name} style={styles.card}>
+              <div style={styles.personHeaderRow} onClick={() => setOpenKey(open ? null : name)}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  {open ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                  <span style={styles.personName}>{name}</span>
+                </div>
+                <GroupSummary items={items} />
+              </div>
+              {open && (
+                <div style={{ marginTop: 10 }}>
+                  <MembersTable
+                    items={[...items].sort((a, b) => b.contractStart.localeCompare(a.contractStart))}
+                    removeMember={removeMember}
+                  />
+                </div>
+              )}
+            </div>
+          );
+        })}
+    </div>
+  );
+}
+
+function MembersTable({ items, removeMember, showPerson }) {
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th style={styles.th}>企業名</th>
+          {showPerson && <th style={styles.th}>紹介担当者</th>}
+          <th style={styles.th}>契約期間</th>
+          <th style={{ ...styles.th, textAlign: 'right' }}>入会金</th>
+          <th style={{ ...styles.th, textAlign: 'right' }}>成果報酬金</th>
+          <th style={styles.th}>メモ</th>
+          <th style={styles.th}></th>
+        </tr>
+      </thead>
+      <tbody>
+        {items.map((m) => (
+          <tr key={m.id} style={styles.tr}>
+            <td style={{ ...styles.td, fontWeight: 600 }}>{m.companyName}</td>
+            {showPerson && <td style={styles.td}>{m.personName}</td>}
+            <td style={styles.td}>
+              {fmtDate(m.contractStart)}
+              {m.contractEnd ? ` 〜 ${fmtDate(m.contractEnd)}` : ' 〜'}
+            </td>
+            <td style={{ ...styles.td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{fmtYen(m.joinFee)}</td>
+            <td style={{ ...styles.td, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }}>{fmtYen(m.rewardFee)}</td>
+            <td style={{ ...styles.td, color: '#8a7b5e' }}>{m.memo || '—'}</td>
+            <td style={styles.td}>
+              <button onClick={() => removeMember(m.id)} style={styles.iconBtn} title="削除">
+                <Trash2 size={13} />
+              </button>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 // ---------------- SHARED: EXPENSE TABLE ----------------
 function ExpenseTable({ items, updateExpense, removeExpense, showPerson, showPaidToggle, hideDelete }) {
   return (
@@ -1065,6 +1656,14 @@ const styles = {
     borderRadius: 10,
     padding: '1px 8px',
   },
+  monthCountChip: {
+    fontSize: 11.5,
+    color: '#5c4a2a',
+    background: '#efe6d1',
+    borderRadius: 8,
+    padding: '3px 10px',
+    fontWeight: 600,
+  },
   unpaidTag: {
     fontSize: 11.5,
     color: STAMP_RED,
@@ -1165,6 +1764,29 @@ const styles = {
     flexDirection: 'column',
     alignItems: 'center',
     padding: '32px 0',
+  },
+  viewToggleBtn: {
+    display: 'flex',
+    alignItems: 'center',
+    padding: '7px 13px',
+    background: '#fffdf8',
+    border: `1px solid ${PAPER_LINE}`,
+    color: '#8a7b5e',
+    borderRadius: 7,
+    fontSize: 12.5,
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  viewToggleBtnActive: {
+    background: INK,
+    color: '#fff',
+    borderColor: INK,
+  },
+  rateEm: {
+    fontStyle: 'normal',
+    color: '#a89a7d',
+    marginLeft: 3,
+    fontSize: 11.5,
   },
 };
 
